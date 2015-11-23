@@ -8,13 +8,18 @@ import java.io.*;
 public class Join extends AbstractDbIterator {
 
     private JoinPredicate _predicate;
-    private DbIterator _outerRelation;
-    private DbIterator _innerRelation;
-    private Iterator<Tuple> _outerPage=null;
-    private Iterator<Tuple> _innerPage=null;
+    private SeqScan _outerRelation;
+    private SeqScan _innerRelation;
+    private TuplesInPage _outerPage=null;
+    private TuplesInPage _innerPage=null;
 
     private Tuple _outerRecent=null;
     private Tuple _innerRecent=null;
+
+    private boolean doneInnerRelation;
+    private boolean needNextOuterPage;
+    private boolean downward;
+    private boolean finish;
 
     private int _joinType = 0;
     private int _numMatches =0;
@@ -24,7 +29,49 @@ public class Join extends AbstractDbIterator {
     public static final int PNL = 1;    
     public static final int BNL = 2;    
     public static final int SMJ = 3;    
-    public static final int HJ = 4;    
+    public static final int HJ = 4;
+
+    /**
+     * Inner class which is used for reading in a page of tuples from relations
+     */
+    private class TuplesInPage implements Iterator<Tuple> {
+        DbIterator relation;
+        int current;
+        Tuple[] tuples;
+
+        public TuplesInPage(DbIterator dbIterator) {
+            relation = dbIterator;
+            tuples = new Tuple[BufferPool.PAGE_SIZE / relation.getTupleDesc().getSize()];
+            try {
+                for (int i = 0; i < tuples.length; i++) {
+                    if (!relation.hasNext()) break;
+                    tuples[i] = relation.next();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            current = 0;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return current < tuples.length && tuples[current] != null;
+        }
+
+        @Override
+        public Tuple next() {
+            Tuple next = hasNext() ? tuples[current++] : null;
+            return next;
+        }
+
+        public void rewind() {
+            current = 0;
+        }
+
+    }
+
+
+
     /**
      * Constructor.  Accepts to children to join and the predicate
      * to join them on
@@ -34,33 +81,45 @@ public class Join extends AbstractDbIterator {
      * @param child2 Iterator for the right(inner) relation to join
      */
     public Join(JoinPredicate p, DbIterator child1, DbIterator child2) {
-	//IMPLEMENT THIS
+        //IMPLEMENT THIS
+        _predicate = p;
+        _outerRelation = (SeqScan) child1;
+        _innerRelation = (SeqScan) child2;
+        doneInnerRelation = true;
+        needNextOuterPage = true;
+        downward = true;
+        finish = false;
     }
 
     public void setJoinAlgorithm(int joinAlgo){
-	_joinType = joinAlgo;
+        _joinType = joinAlgo;
     }
     /**
      * @see simpledb.TupleDesc#combine(TupleDesc, TupleDesc) for possible implementation logic.
      */
     public TupleDesc getTupleDesc() {
-	//IMPLEMENT THIS
-	return null;
+        //IMPLEMENT THIS
+        return TupleDesc.combine(_outerRelation.getTupleDesc(), _innerRelation.getTupleDesc());
     }
 
     public void open()
         throws DbException, NoSuchElementException, TransactionAbortedException, IOException {
-		//IMPLEMENT THIS
-
+        //IMPLEMENT THIS
+        _outerRelation.open();
+        _innerRelation.open();
     }
 
     public void close() {
-//IMPLEMENT THIS
-
+        //IMPLEMENT THIS
+        _outerRelation.close();
+        _innerRelation.close();
+        super.close();
     }
 
     public void rewind() throws DbException, TransactionAbortedException, IOException {
-//IMPLEMENT THIS
+        //IMPLEMENT THIS
+        _outerRelation.rewind();
+        _innerRelation.rewind();
     }
 
     /**
@@ -82,38 +141,194 @@ public class Join extends AbstractDbIterator {
      * @see JoinPredicate#filter
      */
     protected Tuple readNext() throws TransactionAbortedException, DbException {
-	switch(_joinType){
-	case SNL: return SNL_readNext();
-	case PNL: return PNL_readNext();
-	case BNL: return BNL_readNext();
-	case SMJ: return SMJ_readNext();
-	case HJ: return HJ_readNext();
-	default: return SNL_readNext();
-	}
+        switch(_joinType){
+            case SNL: return SNL_readNext();
+            case PNL: return PNL_readNext();
+            case BNL: return BNL_readNext();
+            case SMJ: return SMJ_readNext();
+            case HJ: return HJ_readNext();
+            default: return SNL_readNext();
+        }
     }
 
     protected Tuple SNL_readNext() throws TransactionAbortedException, DbException {
-	//IMPLEMENT THIS 
-	return null;
+        //IMPLEMENT THIS
+        try {
+            while (true) {
+                // If the previous inner loop is finished, the outer tuple should move on to the next one
+                if (doneInnerRelation && !_outerRelation.hasNext()) return null;
+                if (doneInnerRelation) {
+                    // If it's not the first time innerRelation is being read, then it should rewind
+                    if (_innerRecent != null) _innerRelation.rewind();
+                    // use the next outer tuple to check with the inner relation
+                    _outerRecent = _outerRelation.next();
+                }
+                // loop the inner relation to hit match
+                while (_innerRelation.hasNext()) {
+                    _innerRecent = _innerRelation.next();
+                    if (_predicate.filter(_outerRecent, _innerRecent)) {
+                        // because it's inside the loop, mark the flag as false
+                        doneInnerRelation = false;
+                        return joinRecentTuples();
+                    }
+                }
+                // done inner loop, mark the flag as true
+                doneInnerRelation = true;
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return null;
+
     }
 
 
     protected Tuple PNL_readNext() throws TransactionAbortedException, DbException {
-	//IMPLEMENT THIS (EXTRA CREDIT ONLY)
-	return null;
+        //IMPLEMENT THIS (EXTRA CREDIT ONLY)
+        try {
+            while (true) {
+                if (needNextOuterPage) {
+                    // when we need to look at a new page of the outer relation:
+                    if (!_outerRelation.hasNext()) return null;
+                    // read in one page of outer tuples
+                    _outerPage = new TuplesInPage(_outerRelation);
+                    _outerRecent = _outerPage.next();
+                    // If not the first time, the inner relation should rewind because the previous outer page is done
+                    if (_innerPage != null) _innerRelation.rewind();
+                    _innerPage = new TuplesInPage(_innerRelation);
+                }
+
+                // Loop through every tuples in current inner page to hit match
+                while (_innerPage.hasNext()) {
+                    _innerRecent = _innerPage.next();
+                    if (_predicate.filter(_outerRecent, _innerRecent)) {
+                        needNextOuterPage = false;
+                        return joinRecentTuples();
+                    }
+                }
+
+                // If the current outer page is not done, then just rewind the inner page
+                if (_outerPage.hasNext()) {
+                    _outerRecent = _outerPage.next();
+                    _innerPage.rewind();
+                } else if (_innerRelation.hasNext()) { // Current outerpage is done, but inner relation is not done
+                    _outerPage.rewind();
+                    _outerRecent = _outerPage.next();
+                    _innerPage = new TuplesInPage(_innerRelation);
+                } else { // Current outerPage and all innerPages in the innerRelation are all done
+                    needNextOuterPage = true;
+                }
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
     }
 
 
+
     protected Tuple BNL_readNext() throws TransactionAbortedException, DbException {
-	//no need to implement this
-	return null;
+        //no need to implement this
+        return null;
     }
 
 
     protected Tuple SMJ_readNext() throws TransactionAbortedException, DbException {
-	
-	//IMPLEMENT THIS. YOU CAN ASSUME THE JOIN PREDICATE IS ALWAYS =
-	return null;
+        //IMPLEMENT THIS. YOU CAN ASSUME THE JOIN PREDICATE IS ALWAYS =
+        if(finish) return null;
+        // Initialize the first outer tuple and inner tuple
+        if (_outerRecent == null) _outerRecent = _outerRelation.next();
+        if (_innerRecent == null) _innerRecent = _innerRelation.next();
+        Tuple result = null;
+        try {
+            if (downward) { // Pointer needs to move downward
+                // Find the matching tuples
+                while (!equal(_outerRecent, _innerRecent)) {
+                    while (less(_outerRecent, _innerRecent)) {
+                        if (_outerRelation.hasNext()) _outerRecent = _outerRelation.next();
+                        else return null;
+                    }
+                    while (greater(_outerRecent, _innerRecent)) {
+                        if (_innerRelation.hasNext()) _innerRecent = _innerRelation.next();
+                        else return null;
+                    }
+                }
+                Tuple match = _innerRecent;
+                result = joinRecentTuples();
+                if (_innerRelation.hasNext()) {
+                    // When the inner tuple is not the last one of the inner relation
+                    _innerRecent = _innerRelation.next();
+                    // If the tuple is equal to the current match, use the current inner tuple for next iteration
+                    if (equal(_innerRecent, match)) return result;
+                    if (!_outerRelation.hasNext()) {
+                        finish = true;
+                        return result;
+                    }
+                    _outerRecent = _outerRelation.next();
+                    // If the next outer tuple is equal to the current match, move the inner pointer upward
+                    if (equal(_outerRecent, match)) {
+                        _innerRecent = _innerRelation.previous();
+                        _innerRecent = _innerRelation.previous();
+                        downward = false;
+                    }
+                } else {
+                    // When the inner relation reaches its end:
+                    if (!_outerRelation.hasNext()) {
+                        finish = true;
+                        return result;
+                    }
+                    _outerRecent = _outerRelation.next();
+                    // If the next outer tuple is equal to the current match, move the inner pointer upward
+                    if (equal(_outerRecent, match)) {
+                        _innerRecent = _innerRelation.previous();
+                        downward = false;
+                    } else {
+                        finish = true;
+                    }
+                }
+            } else { // If inner pointer needs to move upward:
+                result = joinRecentTuples();
+                Tuple match = _innerRecent;
+                _innerRecent = _innerRelation.previous();
+                // If no more tuples above the current, set the pointer to move downward
+                if (_innerRecent == null) {
+                    if (!_outerRelation.hasNext()) {
+                        finish = true;
+                        return result;
+                    }
+                    _innerRecent = _innerRelation.next();
+                    _outerRecent = _outerRelation.next();
+                    downward = true;
+                } else {
+                    // Otherwise, check if the upper tuple is equal to the current match.
+                    // If so, return; if not, set the pointer move downwards.
+                    if (!equal(match, _innerRecent)) {
+                        if (!_outerRelation.hasNext()) {
+                            finish = true;
+                            return result;
+                        }
+                        _outerRecent = _outerRelation.next();
+                        downward = true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return result;
+    }
+
+    private boolean less(Tuple left, Tuple right) {
+        return _predicate.getLeftField(left).compare(Predicate.Op.LESS_THAN, _predicate.getRightField(right));
+    }
+
+    private boolean greater(Tuple left, Tuple right) {
+        return _predicate.getLeftField(left).compare(Predicate.Op.GREATER_THAN, _predicate.getRightField(right));
+    }
+
+    private boolean equal(Tuple left, Tuple right) {
+        return _predicate.getLeftField(left).compare(Predicate.Op.EQUALS, _predicate.getRightField(right));
     }
 
     protected Tuple HJ_readNext() throws TransactionAbortedException, DbException {
@@ -121,10 +336,24 @@ public class Join extends AbstractDbIterator {
 	return null;
     }
 
+    /**
+     * Return the new tuple joined by _outerRecent and _innerRecent
+     * @return The new tuple after join
+     */
+    private Tuple joinRecentTuples() {
+        return joinTuple(_outerRecent, _innerRecent, getTupleDesc());
+    }
 
     private Tuple joinTuple(Tuple outer, Tuple inner, TupleDesc tupledesc){
-	//IMPLEMENT THIS
-	return null;
+        _numMatches++;
+        Tuple joinedTuple = new Tuple(tupledesc);
+        for (int i = 0; i < outer.getTupleDesc().numFields(); i++) {
+            joinedTuple.setField(i, outer.getField(i));
+        }
+        for (int i = 0; i < inner.getTupleDesc().numFields(); i++) {
+            joinedTuple.setField(inner.getTupleDesc().numFields() + i, inner.getField(i));
+        }
+        return joinedTuple;
     }
 
     public int getNumMatches(){

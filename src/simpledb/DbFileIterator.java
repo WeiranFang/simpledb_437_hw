@@ -40,4 +40,5 @@ public interface DbFileIterator {
     public void close();
 
     public int getPagesRead();
+
 }
